@@ -44,6 +44,19 @@ fn cli_opts() -> ArgMatches<'static> {
                 .takes_value(true)
                 .help("Client identifier"),
         )
+        .arg(
+            Arg::with_name("TOPIC_PREFIX")
+                .short("t")
+                .long("topic-prefix")
+                .takes_value(true)
+                .default_value("dbus")
+        )
+        .arg(
+            Arg::with_name("BUS_NAME")
+                .multiple(true)
+                .required(true)
+                .min_values(1)
+        )
         .get_matches()
 }
 
@@ -66,8 +79,9 @@ fn main() -> Result<()> {
         .value_of("CLIENT_ID")
         .map(|x| x.to_owned())
         .unwrap_or_else(generate_client_id);
-
-    let dbus_mqtt = DBusMqtt::new("org.bluez", mqtt_server_addr, &client_id, "dbus")?;
+    let mqtt_prefix = matches.value_of("TOPIC_PREFIX").ok_or("err")?;
+    let bus_names: Vec<String> = matches.values_of("BUS_NAME").ok_or("err")?.map(|v| v.to_string()).collect();
+    let dbus_mqtt = DBusMqtt::new(&bus_names, mqtt_server_addr, &client_id, mqtt_prefix)?;
     dbus_mqtt.run(&mut system_bus)?;
     Ok(())
 }

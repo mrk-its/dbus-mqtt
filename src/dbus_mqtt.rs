@@ -26,17 +26,18 @@ use std::io::Write;
 type Properties = HashMap<String, arg::Variant<Box<dyn arg::RefArg>>>;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+const BLUEZ_BUS_NAME: &str = "org.bluez";
 
 #[derive(Debug)]
 pub struct DBusMqtt {
-    dbus_name: String,
+    dbus_names: Vec<String>,
     mqtt_prefix: String,
     stream: TcpStream,
 }
 
 impl DBusMqtt {
     pub fn new(
-        dbus_name: &str,
+        dbus_names: &Vec<String>,
         mqtt_server_addr: &str,
         client_id: &str,
         mqtt_prefix: &str,
@@ -51,27 +52,29 @@ impl DBusMqtt {
         );
         send_packet(&sub_packet, &mut stream)?;
         Ok(DBusMqtt {
-            dbus_name: dbus_name.to_string(),
+            dbus_names: dbus_names.clone(),
             mqtt_prefix: mqtt_prefix.to_string(),
             stream: stream,
         })
     }
-    pub fn dbus_name(&self) -> &str {
-        &self.dbus_name
+    pub fn dbus_names(&self) -> &Vec<String> {
+        &self.dbus_names
     }
     pub fn mqtt_prefix(&self) -> &str {
         &self.mqtt_prefix
     }
-    pub fn init(&self, conn: &Connection) -> Result<()> {
-        let proxy = conn.with_proxy(self.dbus_name(), "/", TIMEOUT);
+    pub fn init_dbus(&self, bus_name: &str, conn: &Connection) -> Result<()> {
+        let proxy = conn.with_proxy(bus_name, "/", TIMEOUT);
         let mut cloned_stream = self.stream.try_clone()?;
         let mqtt_prefix = self.mqtt_prefix().to_string();
+        let bus_name_copy = bus_name.to_string();
         proxy.match_signal(
             move |h: ObjectManagerInterfacesAdded, _: &Connection, _: &Message| {
                 debug!("interfaces added: {:?}", h);
                 for (itf_name, properties) in h.interfaces {
                     process_properties(
                         &mqtt_prefix,
+                        &bus_name_copy,
                         &h.object,
                         &itf_name,
                         &properties,
@@ -90,9 +93,10 @@ impl DBusMqtt {
         )?;
 
         let mqtt_prefix = self.mqtt_prefix().to_string();
+        let bus_name_copy = bus_name.to_string();
         let mut cloned_stream = self.stream.try_clone()?;
-        let mr = PropertiesPropertiesChanged::match_rule(Some(&self.dbus_name().into()), None)
-            .static_clone();
+        let mr =
+            PropertiesPropertiesChanged::match_rule(Some(&bus_name.into()), None).static_clone();
         conn.add_match(mr, move |pc: PropertiesPropertiesChanged, _, m| {
             if !(pc.changed_properties.len() == 1 && pc.changed_properties.contains_key("RSSI")) {
                 debug!("properties changed {:?} {:?}", pc, m.path());
@@ -100,6 +104,7 @@ impl DBusMqtt {
             if let Some(path) = m.path() {
                 process_properties(
                     &mqtt_prefix,
+                    &bus_name_copy,
                     &path,
                     &pc.interface_name,
                     &pc.changed_properties,
@@ -111,12 +116,14 @@ impl DBusMqtt {
         })?;
 
         let mqtt_prefix = self.mqtt_prefix().to_string();
+        let bus_name_copy = bus_name.to_string();
         let mut cloned_stream = self.stream.try_clone()?;
         if let Ok(objects) = proxy.get_managed_objects() {
             for (path, v) in objects {
                 for (itf_name, properties) in v {
                     process_properties(
                         &mqtt_prefix,
+                        &bus_name_copy,
                         &path,
                         &itf_name,
                         &properties,
@@ -129,8 +136,12 @@ impl DBusMqtt {
         Ok(())
     }
     pub fn run(&self, connection: &mut Connection) -> Result<()> {
-        self.init(connection)?;
-        setup_ble_discovery(connection)?;
+        for dbus_name in self.dbus_names() {
+            self.init_dbus(dbus_name, connection)?;
+        }
+        if self.dbus_names.iter().find(|x| *x == BLUEZ_BUS_NAME).is_some() {
+            setup_ble_discovery(connection)?;
+        }
         let (mqtt_tx, mqtt_rx): (mpsc::Sender<VariablePacket>, mpsc::Receiver<VariablePacket>) =
             mpsc::channel();
 
@@ -187,23 +198,33 @@ impl DBusMqtt {
                 .count();
         }
     }
-    fn dbus_method_call(&self, topic: &str, payload: &str, conn: &mut Connection) -> Result<()> {
-        let (prefix, method) = match topic.rfind('/') {
-            Some(index) => topic.split_at(index),
-            None => return Err(err("invalid topic")),
-        };
-        let method = method.trim_start_matches('/');
 
-        let (path, itf_name) = match prefix.rfind('/') {
-            Some(index) => prefix.split_at(index),
-            None => return Err(err("topic")),
-        };
-        let itf_name = itf_name.trim_start_matches('/');
-        let path = topic_name_to_path(self.mqtt_prefix(), path);
+    fn parse_topic<'a>(&self, topic: &'a str) -> Option<(&'a str, &'a str, &'a str, &'a str)> {
+        let prefix_len = self.mqtt_prefix.len();
+        if !topic.starts_with(&self.mqtt_prefix)
+            || topic.get(prefix_len..prefix_len + 1) != Some("/")
+        {
+            return None;
+        }
+        let topic = &topic[prefix_len + 1..];
+        let bus_name = topic.split("/").next()?;
+        let mut tail = topic.rsplit("/");
+        let method = tail.next()?;
+        let itf = tail.next()?;
+        let path = &topic[bus_name.len()..topic.len() - method.len() - 1 - itf.len() - 1];
+        Some((bus_name, path, itf, method))
+    }
+
+    fn dbus_method_call(&self, topic: &str, payload: &str, conn: &mut Connection) -> Result<()> {
+        /* topic format:
+           {mqtt_prefix}/{dbus_name}/path/{interface}/{method}
+        */
+        let (bus_name, path, itf_name, method) =
+            self.parse_topic(topic).ok_or("invalid topic")?;
         info!("method call: {:?} {:?} {:?}", path, itf_name, method);
-        let mut msg = dbus::Message::new_method_call(self.dbus_name(), path, itf_name, method)?;
+        let mut msg = dbus::Message::new_method_call(bus_name, path, itf_name, method)?;
         let cmd_args: Option<serde_json::Value> = serde_json::from_str(payload).ok();
-        let arg_spec = self.introspect_method_args(conn, path, itf_name, method)?;
+        let arg_spec = self.introspect_method_args(conn, bus_name, path, itf_name, method)?;
 
         info!("command args: {:?} {:?}", arg_spec, cmd_args);
 
@@ -233,11 +254,12 @@ impl DBusMqtt {
     fn introspect_method_args(
         &self,
         system_bus: &Connection,
+        dbus_name: &str,
         path: &str,
         interface: &str,
         method_name: &str,
     ) -> Result<Vec<String>> {
-        let proxy = system_bus.with_proxy(self.dbus_name(), path, TIMEOUT);
+        let proxy = system_bus.with_proxy(dbus_name, path, TIMEOUT);
         let xml_str: (String,) =
             proxy.method_call("org.freedesktop.DBus.Introspectable", "Introspect", ())?;
 
@@ -282,13 +304,22 @@ fn mqtt_connect(server_addr: &str, client_id: &str) -> Result<TcpStream> {
 
 fn process_properties(
     mqtt_prefix: &str,
+    bus_name: &str,
     path: &Path,
     itf_name: &str,
     properties: &Properties,
     stream: &mut TcpStream,
 ) -> Result<()> {
     for key in properties.keys() {
-        let packet = create_publish_packet(mqtt_prefix, itf_name, path, properties, key, false)?;
+        let packet = create_publish_packet(
+            mqtt_prefix,
+            bus_name,
+            itf_name,
+            path,
+            properties,
+            key,
+            false,
+        )?;
         send_packet(&packet, stream)?;
     }
     Ok(())
@@ -296,6 +327,7 @@ fn process_properties(
 
 fn create_publish_packet(
     mqtt_prefix: &str,
+    bus_name: &str,
     itf_name: &str,
     path: &Path,
     properties: &Properties,
@@ -303,7 +335,7 @@ fn create_publish_packet(
     retain: bool,
 ) -> Result<PublishPacket> {
     let payload = get_payload(properties, key).ok_or("payload")?;
-    let topic = TopicName::new(get_topic_name(mqtt_prefix, path, itf_name, key))?;
+    let topic = TopicName::new(get_topic_name(mqtt_prefix, bus_name, path, itf_name, key))?;
     info!("mqtt publish, topic: {:?}, payload: {}", &topic, &payload);
     let mut packet = PublishPacket::new(topic, QoSWithPacketIdentifier::Level0, payload);
     packet.set_retain(retain && false);
@@ -324,12 +356,17 @@ fn get_payload<'a>(properties: &'a Properties, key: &str) -> Option<String> {
         .flatten()
 }
 
-pub fn get_topic_name(mqtt_prefix: &str, path: &Path, itf_name: &str, suffix: &str) -> String {
-    format!("{}{}/{}/{}", mqtt_prefix, path, itf_name, suffix)
-}
-
-pub fn topic_name_to_path<'a>(mqtt_prefix: &str, topic_name: &'a str) -> &'a str {
-    return &topic_name[mqtt_prefix.len()..];
+pub fn get_topic_name(
+    mqtt_prefix: &str,
+    bus_name: &str,
+    path: &Path,
+    itf_name: &str,
+    suffix: &str,
+) -> String {
+    format!(
+        "{}/{}{}/{}/{}",
+        mqtt_prefix, bus_name, path, itf_name, suffix
+    )
 }
 
 fn setup_ble_discovery(system_bus: &Connection) -> Result<()> {
